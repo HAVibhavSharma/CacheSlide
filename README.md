@@ -13,7 +13,7 @@
 CacheSlide v1: Cross Position-Aware KV Cache Reuse for Faster Serving
 </h3>
 <p align="center">
-  📄 <b>Paper</b>: <a href="[docs/source/CacheSlide.pdf](https://github.com/CacheSlide/CacheSlide-V-1/blob/main/docs/source/CacheSlide.pdf)">PDF</a>
+  📄 <b>Paper link is</b>: <a href="docs/source/CacheSlide.pdf">PDF</a>
 </p>
 
 
