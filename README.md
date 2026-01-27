@@ -183,5 +183,5 @@ If you use CacheSlide for your research, please cite our paper:
 
 * **CUDA 12.6 parity**: if you care about strict reproducibility vs the paper’s CUDA version, use the **build-from-source** path and ensure your driver/toolkit match.
 * **Backend determinism**: pin `VLLM_ATTENTION_BACKEND` for consistent kernels across machines. 
-* **Ongoing updates:** We will continue to update the codebase; as a result, some intermediate versions may be temporarily non-functional. For inquiries, please contact [3042124793@qq.com](mailto:3042124793@qq.com).
+* **Ongoing updates:** We will continue to update the codebase; as a result, some intermediate versions may be temporarily non-functional. For inquiries, please contact [liuyang370@sjtu.edu.cn](mailto:liuyang370@sjtu.edu.cn).
 ---
