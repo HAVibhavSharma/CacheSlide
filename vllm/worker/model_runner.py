@@ -1807,8 +1807,25 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
-        logits = self.model.compute_logits(hidden_or_intermediate_states,
-                                           model_input.sampling_metadata)
+        hidden_states = hidden_or_intermediate_states
+        sampling_metadata = model_input.sampling_metadata
+        cache_fuse_metadata = getattr(getattr(self.model, "model", None),
+                                      "cache_fuse_metadata", None)
+        if cache_fuse_metadata is not None and cache_fuse_metadata.get('kvlink') is not None:
+            temp_data = sampling_metadata.selected_token_indices.clone()
+            sampling_metadata.selected_token_indices[0] = hidden_states.shape[0] - 1
+            cache_fuse_metadata['kvlink'] = None
+            logits = self.model.compute_logits(hidden_states, sampling_metadata)
+            sampling_metadata.selected_token_indices = temp_data
+        elif cache_fuse_metadata is not None and cache_fuse_metadata.get('check'):
+            temp_data = sampling_metadata.selected_token_indices.clone()
+            sampling_metadata.selected_token_indices[0] = hidden_states.shape[0] - 1
+            cache_fuse_metadata['check'] = False
+            logits = self.model.compute_logits(hidden_states, sampling_metadata)
+            sampling_metadata.selected_token_indices = temp_data
+        else:
+            logits = self.model.compute_logits(hidden_or_intermediate_states,
+                                               model_input.sampling_metadata)
 
         if not self.is_driver_worker:
             return []
