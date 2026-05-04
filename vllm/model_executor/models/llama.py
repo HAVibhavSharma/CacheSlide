@@ -513,17 +513,31 @@ class LlamaAttention(nn.Module):
         causal_mask = torch.full(
             (T, T), float('-inf'), device=q.device, dtype=attn_logits.dtype
         ).triu(1)
-        attn_mask = cope_bias + causal_mask                 # [H, T, T]
+        attn_mask = (cope_bias + causal_mask).contiguous()  # [H, T, T]
+
+        # _scaled_dot_product_efficient_attention requires attn_bias.stride(2)
+        # to be a multiple of 8. Pad T to next multiple of 8 if needed.
+        T_pad = (T + 7) // 8 * 8
+        if T_pad != T:
+            pad = T_pad - T
+            attn_mask = torch.nn.functional.pad(attn_mask, (0, pad, 0, pad), value=float('-inf'))
+            q_3d = torch.nn.functional.pad(q_3d, (0, 0, 0, pad))
+            k_3d = torch.nn.functional.pad(k_3d, (0, 0, 0, pad))
+            v_3d = torch.nn.functional.pad(v_3d, (0, 0, 0, pad))
 
         # Use PyTorch's memory-efficient SDPA (FlashAttention when available)
         # q_3d/k_3d/v_3d must be [B, H, T, D]; we treat H as the batch dim.
         attn_out = torch.nn.functional.scaled_dot_product_attention(
-            q_3d.unsqueeze(0),           # [1, H, T, D]
-            k_3d.unsqueeze(0),           # [1, H, T, D]
-            v_3d.unsqueeze(0),           # [1, H, T, D]
-            attn_mask=attn_mask.unsqueeze(0),  # [1, H, T, T]
+            q_3d.unsqueeze(0),           # [1, H, T_pad, D]
+            k_3d.unsqueeze(0),           # [1, H, T_pad, D]
+            v_3d.unsqueeze(0),           # [1, H, T_pad, D]
+            attn_mask=attn_mask.unsqueeze(0),  # [1, H, T_pad, T_pad]
             scale=self.scaling,
-        ).squeeze(0)                     # [H, T, D]
+        ).squeeze(0)                     # [H, T_pad, D]
+
+        # Strip padding if applied
+        if T_pad != T:
+            attn_out = attn_out[:, :T, :]
 
         # ---- 6) Merge heads and project ----
         attn_out = attn_out.permute(1, 0, 2).reshape(
