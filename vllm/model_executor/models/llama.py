@@ -811,7 +811,12 @@ class LlamaModel(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        # CoPE pos_emb is a learned parameter not present in pretrained
+        # checkpoints; mark it as loaded so the strict weight check passes.
+        loaded_params: Set[str] = {
+            name for name in params_dict
+            if "rotary_emb.pos_emb" in name
+        }
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
