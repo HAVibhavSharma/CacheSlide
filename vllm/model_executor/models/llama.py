@@ -348,11 +348,9 @@ class LlamaAttention(nn.Module):
         #     partial_rotary_factor=self.partial_rotary_factor,
         # )
 
-        self.rotary_emb = get_cope(
+        self.cope = get_cope(
             npos_max=self.npos_max,
             head_dim=self.head_dim,
-            # device=device,
-            # dtype=dtype,
         )
 
         if hasattr(config, "interleaved_sliding_window"):
@@ -389,174 +387,140 @@ class LlamaAttention(nn.Module):
         cache_idx: Optional[torch.Tensor] = None,
         wca_ctx: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
-        """
-        Requirements / assumptions:
-        - self.qkv_proj returns qkv (and maybe bias) and you already split it
-        - self.rotary_emb(positions, q, k) works
-        - self.attn(q,k,v) works
-        - self has attributes: self.kv_size, self.num_kv_heads, self.head_dim, self.q_size
-        - cache_idx: reused token positions have >=0, miss tokens are -1
-        - KV_cache provides K (+ optional V) in one of KVCACHE formats
-
-        IMPORTANT:
-        - wca_ctx must be the SAME dict passed through all layers of ONE request.
-          Create it outside the layer loop and pass it into every layer forward.
-        """
-
-        # ---- 0) QKV + rotary ----
+        # ---- 0) QKV — CoPE replaces RoPE (Section 2.4); no rotary applied ----
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        T = hidden_states.shape[0]
 
-        # ---- KV reuse hook (epic-style, used by examples/CacheSlide.py) ----
-        # During collect-mode prefill, expose post-rotary (K,V) so the harness
-        # can snapshot per-chunk KVs via self.attn.hack_kv.
+        # ---- KV collect hook (for CacheSlide harness) ----
         cfm = getattr(self, "_cache_fuse_metadata", None)
         if cfm is not None and cfm.get("collect", False):
             self.attn.hack_kv = (k.detach().clone(), v.detach().clone())
 
-        # ---- 1)WCA defaults ----
+        # ---- 1) WCA context defaults (Algorithm 2 parameters) ----
         if wca_ctx is None:
             wca_ctx = {}
         topk_ratio = float(wca_ctx.get("topk_ratio", 0.26))
         tau = float(wca_ctx.get("tau", 0.12))
         eps = float(wca_ctx.get("eps", 1e-6))
         reselection_period = int(wca_ctx.get("reselect_period", 4))
-        drop_if_low = bool(
-            wca_ctx.get("drop_if_low", True)
-        )  # True: drop cksim < tau
+        drop_if_low = bool(wca_ctx.get("drop_if_low", True))
 
-        # ---- 2) flatten views ----
-        D = k.shape[-1]  # should == self.kv_size
-        k_flat = k.reshape(-1, D)
-        v_flat = v.reshape(-1, D)
-
-        # Save recomputed K/V BEFORE overwriting with cache.
-        # Use clone() to avoid view/in-place aliasing issues.
-        k_rec_flat = k_flat.clone()
+        # ---- 2) Flat K/V views for in-place WCA manipulation ----
+        D_kv = k.shape[-1]
+        k_flat = k.reshape(-1, D_kv)
+        v_flat = v.reshape(-1, D_kv)
+        k_rec_flat = k_flat.clone()   # recomputed KV saved before any overwrite
         v_rec_flat = v_flat.clone()
 
-        # ---- 3) If no reuse info / no cache, skip WCA ----
-        if cache_idx is None or KV_cache is None:
-            attn_output = self.attn(q, k, v)
-            output, _ = self.o_proj(attn_output)
-            return output
+        # ---- 3) Weighted Correction Attention (Algorithm 2) ----
+        if cache_idx is not None and KV_cache is not None:
+            reuse_mask_flat = cache_idx.reshape(-1) >= 0
+            if reuse_mask_flat.any():
+                reuse_pos = reuse_mask_flat.nonzero(as_tuple=False).squeeze(-1)
+                k_cache, v_cache = _split_kv_cache(KV_cache, self.kv_size)
 
-        reuse_mask_flat = cache_idx.reshape(-1) >= 0
-        if not reuse_mask_flat.any():
-            attn_output = self.attn(q, k, v)
-            output, _ = self.o_proj(attn_output)
-            return output
+                k_reuse_full = _gather_cache_full_flat(
+                    k_cache, cache_idx, D_kv).to(k_flat.dtype)
+                v_reuse_full = (
+                    _gather_cache_full_flat(v_cache, cache_idx, D_kv).to(v_flat.dtype)
+                    if v_cache is not None else None
+                )
 
-        # ---- 4) Gather cached K/V for all tokens ----
-        reuse_pos = reuse_mask_flat.nonzero(as_tuple=False).squeeze(-1)  # [Nr]
-        k_cache, v_cache = _split_kv_cache(KV_cache, self.kv_size)
+                # Baseline: reused-token slots filled with cached KV (Alg.2 step 10)
+                k_flat.index_copy_(0, reuse_pos,
+                                   k_reuse_full.index_select(0, reuse_pos))
+                if v_reuse_full is not None:
+                    v_flat.index_copy_(0, reuse_pos,
+                                       v_reuse_full.index_select(0, reuse_pos))
 
-        k_reuse_full = _gather_cache_full_flat(k_cache, cache_idx, D).to(
-            k_flat.dtype
-        )  # [N,D]
-        v_reuse_full = None
-        if v_cache is not None:
-            v_reuse_full = _gather_cache_full_flat(v_cache, cache_idx, D).to(
-                v_flat.dtype
-            )
+                # Layer 1 — initialise deviation-sorted set S and top-k subset Sk
+                if layernums == 1:
+                    k_rec_r = k_rec_flat.index_select(0, reuse_pos).float()
+                    k_ruse_r = k_reuse_full.index_select(0, reuse_pos).float()
+                    diff = (k_rec_r - k_ruse_r).pow(2).sum(dim=-1)
+                    k_count = max(1, int(topk_ratio * diff.numel()))
+                    S_sorted = reuse_pos.index_select(
+                        0, torch.argsort(diff, descending=True)).contiguous()
+                    wca_ctx["S_sorted"] = S_sorted
+                    wca_ctx["Sk"] = S_sorted[:k_count].contiguous()
+                    wca_ctx["ptr"] = k_count
 
-        # ---- 5) Paper semantics: for reused tokens, baseline uses cached KV ----
-        k_flat.index_copy_(
-            0, reuse_pos, k_reuse_full.index_select(0, reuse_pos)
-        )
-        if v_reuse_full is not None:
-            v_flat.index_copy_(
-                0, reuse_pos, v_reuse_full.index_select(0, reuse_pos)
-            )
+                # Layers ≥2 — weighted fusion for Sk (Alg.2 step 10–11)
+                Sk = wca_ctx.get("Sk", None)
+                if isinstance(Sk, torch.Tensor) and Sk.numel() > 0 and layernums >= 2:
+                    Sk = Sk.to(k_flat.device).long()
+                    k_ruse_Sk = k_reuse_full.index_select(0, Sk).float()
+                    k_rec_Sk = k_rec_flat.index_select(0, Sk).float()
+                    num = (k_rec_Sk - k_ruse_Sk).pow(2).sum(dim=-1)
+                    den = k_ruse_Sk.pow(2).sum(dim=-1).clamp_min(eps)
+                    alpha = (num / den).clamp(0.0, 1.0).to(k_flat.dtype).unsqueeze(-1)
+                    k_flat.index_copy_(
+                        0, Sk,
+                        (alpha * k_rec_Sk + (1 - alpha) * k_ruse_Sk).to(k_flat.dtype))
+                    if v_reuse_full is not None:
+                        v_ruse_Sk = v_reuse_full.index_select(0, Sk).float()
+                        v_rec_Sk = v_rec_flat.index_select(0, Sk).float()
+                        v_flat.index_copy_(
+                            0, Sk,
+                            (alpha * v_rec_Sk + (1 - alpha) * v_ruse_Sk).to(v_flat.dtype))
 
-        # ---- 6) Layer 1: build S_sorted / Sk / ptr ----
-        if layernums == 1:
-            # d_i = ||Krec - Kreuse||^2 on reused tokens
-            k_rec_reuse = k_rec_flat.index_select(
-                0, reuse_pos
-            ).float()  # [Nr,D]
-            k_reuse_reuse = k_reuse_full.index_select(
-                0, reuse_pos
-            ).float()  # [Nr,D]
-            diff = (k_rec_reuse - k_reuse_reuse).pow(2).sum(dim=-1)  # [Nr]
+                    # Gated reselection every N layers (Alg.2 step 12–17)
+                    if reselection_period > 0 and (layernums % reselection_period == 0):
+                        S_sorted = wca_ctx.get("S_sorted")
+                        ptr = int(wca_ctx.get("ptr", 0))
+                        if isinstance(S_sorted, torch.Tensor) and ptr < S_sorted.numel():
+                            cksim = _token_cksim(
+                                k_rec_Sk.to(k_flat.dtype),
+                                k_ruse_Sk.to(k_flat.dtype),
+                                num_kv_heads=self.num_kv_heads,
+                                head_dim=self.head_dim,
+                            )
+                            drop_mask = cksim < tau if drop_if_low else cksim > tau
+                            n_drop = int(drop_mask.sum().item())
+                            if n_drop > 0:
+                                end = min(ptr + n_drop, S_sorted.numel())
+                                wca_ctx["Sk"] = torch.cat([
+                                    Sk[~drop_mask].contiguous(),
+                                    S_sorted[ptr:end].to(Sk.device).long(),
+                                ], dim=0)
+                                wca_ctx["ptr"] = end
 
-            nr = diff.numel()
-            k_count = max(1, int(topk_ratio * nr))
+        # ---- 4) Reshape for multi-head attention ----
+        # q : [T, H*D]   → [H, T, D]
+        # k/v: [T, Hkv*D] → [Hkv, T, D]
+        q_3d = q.view(T, self.num_heads, self.head_dim).permute(1, 0, 2)
+        k_3d = k_flat.view(T, self.num_kv_heads, self.head_dim).permute(1, 0, 2)
+        v_3d = v_flat.view(T, self.num_kv_heads, self.head_dim).permute(1, 0, 2)
 
-            sorted_local = torch.argsort(diff, descending=True)  # [Nr]
-            S_sorted = reuse_pos.index_select(
-                0, sorted_local
-            ).contiguous()  # [Nr] (flat token indices)
-            Sk = S_sorted[:k_count].contiguous()
-            ptr = int(k_count)
+        # Expand K/V for grouped-query attention (GQA)
+        if self.num_heads != self.num_kv_heads:
+            g = self.num_heads // self.num_kv_heads
+            k_3d = k_3d.repeat_interleave(g, dim=0)
+            v_3d = v_3d.repeat_interleave(g, dim=0)
 
-            wca_ctx["S_sorted"] = S_sorted
-            wca_ctx["Sk"] = Sk
-            wca_ctx["ptr"] = ptr
+        # ---- 5) CoPE attention (paper Section 2.4 / Algorithm 1) ----
+        # Scaled dot-product logits (no positional rotation on Q/K —
+        # CoPE provides all positional information via the additive bias below)
+        attn_logits = torch.bmm(
+            q_3d, k_3d.transpose(-1, -2)) * self.scaling  # [H, T, T]
 
-        # ---- 7) Layer >=2: fuse only for Sk (K and V) ----
-        Sk = wca_ctx.get("Sk", None)
-        if isinstance(Sk, torch.Tensor) and Sk.numel() > 0 and layernums >= 2:
-            Sk = Sk.to(k_flat.device).long()
+        # CoPE bias: context-dependent positional bias added to logits
+        cope_bias = self.cope(q_3d, attn_logits)           # [H, T, T]
+        attn_logits = attn_logits + cope_bias
 
-            k_reuse_Sk = k_reuse_full.index_select(0, Sk).float()
-            k_rec_Sk = k_rec_flat.index_select(0, Sk).float()
+        # Causal mask
+        causal_mask = torch.full(
+            (T, T), float('-inf'), device=q.device, dtype=attn_logits.dtype
+        ).triu(1)
+        attn_weights = (attn_logits + causal_mask).softmax(dim=-1)  # [H, T, T]
+        attn_out = torch.bmm(attn_weights, v_3d)                    # [H, T, D]
 
-            # alpha = ||Krec - Kreuse||^2 / (||Kreuse||^2 + eps), clamp [0,1]
-            num = (k_rec_Sk - k_reuse_Sk).pow(2).sum(dim=-1)  # [k]
-            den = k_reuse_Sk.pow(2).sum(dim=-1).clamp_min(eps)  # [k]
-            alpha = (num / den).clamp(0.0, 1.0).to(k_flat.dtype)  # [k]
-
-            alpha_col = alpha.unsqueeze(-1)  # [k,1]
-            k_fused = alpha_col * k_rec_Sk.to(k_flat.dtype) + (
-                1 - alpha_col
-            ) * k_reuse_Sk.to(k_flat.dtype)
-            k_flat.index_copy_(0, Sk, k_fused)
-
-            if v_reuse_full is not None:
-                v_reuse_Sk = v_reuse_full.index_select(0, Sk).float()
-                v_rec_Sk = v_rec_flat.index_select(0, Sk).float()
-                v_fused = alpha_col * v_rec_Sk.to(v_flat.dtype) + (
-                    1 - alpha_col
-                ) * v_reuse_Sk.to(v_flat.dtype)
-                v_flat.index_copy_(0, Sk, v_fused)
-
-            # ---- 8) gated reselection every N layers ----
-            if reselection_period > 0 and (layernums % reselection_period == 0):
-                S_sorted = wca_ctx.get("S_sorted", None)
-                ptr = int(wca_ctx.get("ptr", 0))
-                if (
-                    isinstance(S_sorted, torch.Tensor)
-                    and ptr < S_sorted.numel()
-                ):
-                    # CKSim on Sk using Krec vs Kreuse (token-level)
-                    cksim = _token_cksim(
-                        k_rec_Sk.to(k_flat.dtype),
-                        k_reuse_Sk.to(k_flat.dtype),
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim=self.head_dim,
-                    )
-                    drop_mask = (cksim < tau) if drop_if_low else (cksim > tau)
-                    n_drop = int(drop_mask.sum().item())
-
-                    if n_drop > 0:
-                        kept = Sk[~drop_mask].contiguous()
-                        end = min(ptr + n_drop, S_sorted.numel())
-                        new = S_sorted[ptr:end].to(Sk.device).long()
-                        Sk_new = torch.cat([kept, new], dim=0)
-
-                        wca_ctx["Sk"] = Sk_new
-                        wca_ctx["ptr"] = end
-
-        # ---- 9) reshape back and run attention ----
-        k = k_flat.view_as(k)
-        v = v_flat.view_as(v)
-
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
-
-    # ---- End WCA defaults ----
+        # ---- 6) Merge heads and project ----
+        attn_out = attn_out.permute(1, 0, 2).reshape(
+            T, self.num_heads * self.head_dim)
+        output, _ = self.o_proj(attn_out)
+        return output
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -824,7 +788,7 @@ class LlamaModel(nn.Module):
         # checkpoints; mark it as loaded so the strict weight check passes.
         loaded_params: Set[str] = {
             name for name in params_dict
-            if "rotary_emb.pos_emb" in name
+            if ".pos_emb" in name
         }
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
