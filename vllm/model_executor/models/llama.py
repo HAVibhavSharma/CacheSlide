@@ -384,8 +384,8 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        layernums: int,
-        KV_cache: Optional[KVCACHE],
+        layernums: int = 0,
+        KV_cache: Optional[KVCACHE] = None,
         cache_idx: Optional[torch.Tensor] = None,
         wca_ctx: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
@@ -640,7 +640,12 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states, residual
             )
         hidden_states = self.self_attn(
-            positions=positions, hidden_states=hidden_states
+            positions=positions,
+            hidden_states=hidden_states,
+            layernums=layernums,
+            KV_cache=KV_cache,
+            cache_idx=cache_idx,
+            wca_ctx=wca_ctx,
         )
 
         # Fully Connected
