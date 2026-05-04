@@ -626,6 +626,10 @@ class LlamaDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        layernums: int = 0,
+        KV_cache=None,
+        cache_idx=None,
+        wca_ctx=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
