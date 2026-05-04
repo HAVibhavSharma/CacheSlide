@@ -336,7 +336,7 @@ def run_one(llm: LLM,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-v0.2")
-    parser.add_argument("--gpu_mem_util", type=float, default=0.5)
+    parser.add_argument("--gpu_mem_util", type=float, default=0.90)
 
     parser.add_argument("--dataset", type=str, choices=["hotpotqa", "msc", "swebench"], default="hotpotqa")
     parser.add_argument("--hf_name", type=str, default=None,

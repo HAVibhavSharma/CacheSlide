@@ -500,21 +500,30 @@ class LlamaAttention(nn.Module):
             v_3d = v_3d.repeat_interleave(g, dim=0)
 
         # ---- 5) CoPE attention (paper Section 2.4 / Algorithm 1) ----
-        # Scaled dot-product logits (no positional rotation on Q/K —
-        # CoPE provides all positional information via the additive bias below)
+        # CoPE requires the raw logits to compute context-dependent positions,
+        # so we materialise them explicitly, then pass the CoPE bias as the
+        # attn_mask to F.scaled_dot_product_attention (which fuses softmax+V).
         attn_logits = torch.bmm(
             q_3d, k_3d.transpose(-1, -2)) * self.scaling  # [H, T, T]
 
-        # CoPE bias: context-dependent positional bias added to logits
+        # CoPE bias: context-dependent positional encoding added to logits
         cope_bias = self.cope(q_3d, attn_logits)           # [H, T, T]
-        attn_logits = attn_logits + cope_bias
 
-        # Causal mask
+        # Causal mask fused with CoPE bias so SDPA only needs one attn_mask
         causal_mask = torch.full(
             (T, T), float('-inf'), device=q.device, dtype=attn_logits.dtype
         ).triu(1)
-        attn_weights = (attn_logits + causal_mask).softmax(dim=-1)  # [H, T, T]
-        attn_out = torch.bmm(attn_weights, v_3d)                    # [H, T, D]
+        attn_mask = cope_bias + causal_mask                 # [H, T, T]
+
+        # Use PyTorch's memory-efficient SDPA (FlashAttention when available)
+        # q_3d/k_3d/v_3d must be [B, H, T, D]; we treat H as the batch dim.
+        attn_out = torch.nn.functional.scaled_dot_product_attention(
+            q_3d.unsqueeze(0),           # [1, H, T, D]
+            k_3d.unsqueeze(0),           # [1, H, T, D]
+            v_3d.unsqueeze(0),           # [1, H, T, D]
+            attn_mask=attn_mask.unsqueeze(0),  # [1, H, T, T]
+            scale=self.scaling,
+        ).squeeze(0)                     # [H, T, D]
 
         # ---- 6) Merge heads and project ----
         attn_out = attn_out.permute(1, 0, 2).reshape(
