@@ -312,7 +312,7 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.npos_max = (
-            max_position_embeddings / 2
+            max_position_embeddings // 2
         )  # set the maximum number of CoPE position buckets as needed.
 
         self.qkv_proj = QKVParallelLinear(
