@@ -2,8 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import os
 import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# CacheSlide reaches into the live model object (cache_fuse_metadata, old_kvs)
+# from the parent process, which only works when the engine core runs in-process.
+# v1 defaults to a separate engine-core subprocess; force single-process mode.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch
 from datasets import load_dataset
@@ -37,6 +43,11 @@ def get_vllm_core_model(llm: LLM) -> Any:
     Your fork path may differ; we try a few common ones.
     """
     candidates = [
+        # vLLM v1, in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0):
+        # driver_worker is a WorkerWrapperBase whose real worker lives at .worker
+        ["llm_engine", "model_executor", "driver_worker", "worker", "model_runner", "model", "model"],
+        ["llm_engine", "model_executor", "driver_worker", "worker", "model_runner", "model"],
+        # legacy v0 layouts
         ["llm_engine", "model_executor", "driver_worker", "model_runner", "model", "model"],
         ["llm_engine", "model_executor", "driver_worker", "model_runner", "model"],
         ["llm_engine", "model_executor", "worker", "model_runner", "model", "model"],
