@@ -4,6 +4,7 @@
 import argparse
 import os
 import random
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # CacheSlide reaches into the live model object (cache_fuse_metadata, old_kvs)
@@ -326,17 +327,23 @@ def run_one(llm: LLM,
     cache_fuse_metadata["collect"] = False
     cache_fuse_metadata["suffix_len"] = suffix_len
 
+    # vLLM v1 returns RequestOutput.metrics=None unless stats logging is on,
+    # so use a wall-clock timer. Both branches do prefill + max_new_tokens
+    # decode steps with temperature=0, so the wall-clock difference is a
+    # faithful proxy for the TTFT difference we want to compare.
+    t0 = time.perf_counter()
     out_cached = llm.generate([input_prompt], gen_params)[0]
+    cached_ttft = time.perf_counter() - t0
     cached_text = out_cached.outputs[0].text
-    cached_ttft = float(out_cached.metrics.first_token_time - out_cached.metrics.first_scheduled_time)
 
     # 4) Normal generation (no reuse)
     cache_fuse_metadata["check"] = False
     cache_fuse_metadata["collect"] = False
 
+    t0 = time.perf_counter()
     out_normal = llm.generate([input_prompt], gen_params)[0]
+    normal_ttft = time.perf_counter() - t0
     normal_text = out_normal.outputs[0].text
-    normal_ttft = float(out_normal.metrics.first_token_time - out_normal.metrics.first_scheduled_time)
 
     return cached_text, cached_ttft, normal_text, normal_ttft
 
