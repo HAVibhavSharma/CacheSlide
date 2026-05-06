@@ -395,7 +395,7 @@ class LlamaAttention(nn.Module):
         # ---- KV collect hook (for CacheSlide harness) ----
         cfm = getattr(self, "_cache_fuse_metadata", None)
         if cfm is not None and cfm.get("collect", False):
-            self.attn.hack_kv = (k.detach().clone(), v.detach().clone())
+            self.hack_kv = (k.detach().clone(), v.detach().clone())
 
         # ---- 1) WCA context defaults (Algorithm 2 parameters) ----
         if wca_ctx is None:
@@ -686,7 +686,7 @@ class LlamaModel(nn.Module):
         # ---- Cache-fuse hooks (epic-style) used by examples/CacheSlide.py ----
         # `cache_fuse_metadata` is a shared dict toggled by the harness:
         #   collect=True  -> attention layers stash post-rotary (K,V) into
-        #                    self_attn.attn.hack_kv during prefill.
+        #                    self_attn.hack_kv during prefill.
         #   check=True    -> harness has injected concatenated chunk KVs into
         #                    `old_kvs` and expects reuse on the next generate.
         # NOTE: actual KV-splice on `check` requires backend support; the
