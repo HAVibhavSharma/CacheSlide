@@ -504,18 +504,28 @@ class LlamaAttention(nn.Module):
         # we materialise [H,T,T] anyway. Finish softmax+V manually rather than
         # calling SDPA: SDPA's mem-efficient backend would recompute Q@K^T and
         # also rejects bias tensors whose key-dim stride isn't a multiple of 8.
+        # In-place ops keep peak memory at ~2x[H,T,T] (logits + cope_bias)
+        # rather than 4x; with T=4096 H=32 fp16 that's ~2 GiB instead of ~4 GiB.
         attn_logits = torch.bmm(
-            q_3d, k_3d.transpose(-1, -2)) * self.scaling  # [H, T, T]
+            q_3d, k_3d.transpose(-1, -2))                   # [H, T, T]
+        attn_logits.mul_(self.scaling)
 
-        cope_bias = self.cope(q_3d, attn_logits)           # [H, T, T]
+        cope_bias = self.cope(q_3d, attn_logits)            # [H, T, T]
+        attn_logits.add_(cope_bias)
+        del cope_bias
 
-        causal_mask = torch.full(
-            (T, T), float('-inf'), device=q.device, dtype=attn_logits.dtype
-        ).triu(1)
-        attn_logits = attn_logits + cope_bias + causal_mask
+        causal_mask = torch.triu(
+            torch.full((T, T), float('-inf'),
+                       device=q.device, dtype=attn_logits.dtype),
+            diagonal=1,
+        )
+        attn_logits.add_(causal_mask)
+        del causal_mask
 
         attn_weights = torch.softmax(attn_logits, dim=-1)
+        del attn_logits
         attn_out = torch.bmm(attn_weights, v_3d)            # [H, T, D]
+        del attn_weights
 
         # ---- 6) Merge heads and project ----
         attn_out = attn_out.permute(1, 0, 2).reshape(

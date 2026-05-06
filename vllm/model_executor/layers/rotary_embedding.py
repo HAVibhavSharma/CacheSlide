@@ -41,18 +41,29 @@ class CoPE(nn.Module):
         self.pos_emb = nn.parameter.Parameter(torch.zeros(1, head_dim, npos_max))
 
     def forward(self, query, attn_logits):
+        # Reverse-cumsum without two flips: total - cumsum + gates is the same
+        # as gates.flip(-1).cumsum(-1).flip(-1) but allocates one fewer [H,T,T].
         gates = torch.sigmoid(attn_logits)
-        pos = gates.flip(-1).cumsum(dim=-1).flip(-1)
-        pos = pos.clamp(max=self.npos_max - 1)
-
-        pos_ceil = pos.ceil().long()
-        pos_floor = pos.floor().long()
+        cum = gates.cumsum(dim=-1)
+        total = cum[..., -1:].clone()
+        pos = total - cum + gates
+        del cum, total, gates
+        pos.clamp_(max=self.npos_max - 1)
 
         logits_int = torch.matmul(query, self.pos_emb)
 
-        logits_ceil = logits_int.gather(-1, pos_ceil)
-        logits_floor = logits_int.gather(-1, pos_floor)
-        w = pos - pos_floor
+        # pos is non-negative (sum of sigmoids), so .long() is floor.
+        # gather requires int64 indices, but we only need ONE int64 [H,T,T]
+        # alive at a time: gather floor, then mutate the same buffer in-place
+        # into ceil (= floor+1, clamped) and gather again. Saves ~4 GiB at
+        # T=4096 H=32 vs holding both pos_floor and pos_ceil simultaneously.
+        pos_idx = pos.to(torch.int64)
+        w = pos - pos_idx
+        del pos
+        logits_floor = logits_int.gather(-1, pos_idx)
+        pos_idx.add_(1).clamp_(max=self.npos_max - 1)
+        logits_ceil = logits_int.gather(-1, pos_idx)
+        del pos_idx
         return logits_ceil * w + logits_floor * (1 - w)
 
 

@@ -348,12 +348,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-v0.2")
     parser.add_argument("--gpu_mem_util", type=float, default=0.90)
-    parser.add_argument("--max_batched_tokens", type=int, default=8192,
-                        help="Cap on tokens per batch. CoPE materialises [T,T] "
-                             "logits, so this directly bounds peak attention "
-                             "memory. 8192 ~= 4 GiB at fp16 with H=32.")
-    parser.add_argument("--max_model_len", type=int, default=8192,
-                        help="Cap on context length per request. Same [T,T] "
+    parser.add_argument("--max_batched_tokens", type=int, default=4096,
+                        help="Cap on tokens per batch. CoPE materialises [H,T,T] "
+                             "logits (and several copies live simultaneously), "
+                             "so this directly bounds peak attention memory. "
+                             "4096 ~= 1 GiB per [H,T,T] at fp16 with H=32.")
+    parser.add_argument("--max_model_len", type=int, default=4096,
+                        help="Cap on context length per request. Same [H,T,T] "
                              "constraint as above.")
 
     parser.add_argument("--dataset", type=str, choices=["hotpotqa", "msc", "swebench"], default="hotpotqa")
