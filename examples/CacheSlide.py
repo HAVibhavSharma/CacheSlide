@@ -385,7 +385,15 @@ def main():
     ds = load_dataset(hf_name, hf_config, split=args.split)
 
     # vLLM + tokenizer
-    llm = LLM(model=args.model, gpu_memory_utilization=args.gpu_mem_util)
+    # enforce_eager=True: the harness mutates per-layer state (hack_kv) and
+    # cache_fuse_metadata mid-run. Those Python side-effects are dropped by
+    # torch.compile's cached inductor graph, so the captured graph would run
+    # without ever populating hack_kv. Eager mode keeps the side effects live.
+    llm = LLM(
+        model=args.model,
+        gpu_memory_utilization=args.gpu_mem_util,
+        enforce_eager=True,
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     # Some vLLM forks let you override tokenizer explicitly; ignore if missing.
