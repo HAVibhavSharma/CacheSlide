@@ -348,6 +348,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-v0.2")
     parser.add_argument("--gpu_mem_util", type=float, default=0.90)
+    parser.add_argument("--max_batched_tokens", type=int, default=8192,
+                        help="Cap on tokens per batch. CoPE materialises [T,T] "
+                             "logits, so this directly bounds peak attention "
+                             "memory. 8192 ~= 4 GiB at fp16 with H=32.")
+    parser.add_argument("--max_model_len", type=int, default=8192,
+                        help="Cap on context length per request. Same [T,T] "
+                             "constraint as above.")
 
     parser.add_argument("--dataset", type=str, choices=["hotpotqa", "msc", "swebench"], default="hotpotqa")
     parser.add_argument("--hf_name", type=str, default=None,
@@ -389,10 +396,16 @@ def main():
     # cache_fuse_metadata mid-run. Those Python side-effects are dropped by
     # torch.compile's cached inductor graph, so the captured graph would run
     # without ever populating hack_kv. Eager mode keeps the side effects live.
+    #
+    # max_num_batched_tokens / max_model_len capped because this CoPE attention
+    # materialises [H, T, T] logits to feed CoPE; T=32768 with H=32 fp16 is
+    # 64 GiB, which OOMs even on a 93 GB GPU. 8192 keeps the matrix at ~4 GiB.
     llm = LLM(
         model=args.model,
         gpu_memory_utilization=args.gpu_mem_util,
         enforce_eager=True,
+        max_num_batched_tokens=args.max_batched_tokens,
+        max_model_len=args.max_model_len,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
